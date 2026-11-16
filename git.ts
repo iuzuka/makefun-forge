@@ -3,10 +3,7 @@
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync, Inflate } from 'node:zlib';
 import { storage } from './storage.ts';
-import type { GitObject, TreeEntry, CommitData, Ref } from './storage.ts';
-
-export const ZERO_OID = '0'.repeat(40);
-const PKT_LINE_MAX = 65520;
+import type { GitObject, TreeEntry, CommitData, Ref } from './storage.ts';const PKT_LINE_MAX = 65520;
 
 // ============================================================================
 // Git Object Helpers
@@ -1011,4 +1008,4 @@ if (!originalStorage.gitObjects) {
   originalStorage.parseCommit = parseCommit;
   originalStorage.parseTree = parseTree;
 }
-export const ZERO_OID = '0'.repeat(40);
+export export const ZERO_OID = '0'.repeat(40);
