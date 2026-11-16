@@ -22,21 +22,17 @@ import {
   encodePktLines,
   pktLineFlush,
   decodePktLines,
-  GitPacket,
   parseAdvertisement,
   formatRefsAdvertisementV2,
-  AdvertisedRef,
   handleReceivePack,
-  PushCommand,
-  PushReport,
   parsePushCommands,
   formatPushReport,
   ZERO_OID,
   collectReachable,
   readPack,
   writePack,
-  GitObject,
 } from './git.ts';
+import type { GitPacket, AdvertisedRef, PushCommand, PushReport, GitObject } from './git.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
