@@ -1008,4 +1008,4 @@ if (!originalStorage.gitObjects) {
   originalStorage.parseCommit = parseCommit;
   originalStorage.parseTree = parseTree;
 }
-export export const ZERO_OID = '0'.repeat(40);
+export const ZERO_OID = '0'.repeat(40);
