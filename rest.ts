@@ -46,9 +46,8 @@ export function getAuthUser(req: IncomingMessage): User | null {
   const auth = req.headers.authorization;
   if (!auth || !auth.startsWith('Bearer ')) return null;
   const token = auth.slice('Bearer '.length);
-  // In a real implementation, validate token against a user
-  // For now, we use a fixed user based on the token
-  return { id: 1000, login: 'viewer', name: 'Viewer', email: 'viewer@example.invalid' };
+  // The token IS the login (MAKEFUN_SHOP_TOKEN = viewer's login)
+  return storage.getUserByToken(token);
 }
 
 function requireAuth(req: IncomingMessage, res: ServerResponse): User | null {
@@ -276,19 +275,34 @@ export function handleContents(req: IncomingMessage, res: ServerResponse): boole
         return;
       }
       
-      // For now, return a mock response - will implement proper git storage later
-      const contentSha = 'a'.repeat(40);
-      const commitSha = 'b'.repeat(40);
-      
-      sendJson(res, 201, {
-        content: {
-          sha: contentSha,
-          encoding: 'base64',
-        },
-        commit: {
-          sha: commitSha,
-        },
-      });
+      try {
+        const result = storage.putFileContent(repo.id, filePath, decodedContent, message, branch, sha);
+        if (!result) {
+          sendError(res, 404, 'Not Found');
+          return;
+        }
+        
+        const isUpdate = sha !== undefined;
+        sendJson(res, isUpdate ? 200 : 201, {
+          content: {
+            sha: result.contentSha,
+            encoding: 'base64',
+            size: Buffer.byteLength(decodedContent, 'utf8'),
+          },
+          commit: {
+            sha: result.commitSha,
+          },
+        });
+      } catch (err) {
+        if (err instanceof Error && err.message === 'SHA_CONFLICT') {
+          sendJson(res, 409, {
+            message: 'sha does not match',
+            documentation_url: 'https://docs.github.com/rest/repos/contents#create-or-update-file-contents',
+          });
+        } else {
+          sendError(res, 500, 'Internal Server Error');
+        }
+      }
     }).catch(() => sendError(res, 400, 'Malformed JSON'));
     return true;
   }
@@ -297,16 +311,30 @@ export function handleContents(req: IncomingMessage, res: ServerResponse): boole
     // GET /repos/{owner}/{repo}/contents/{path}
     const url = new URL(req.url ?? '', 'http://localhost');
     const ref = url.searchParams.get('ref') || repo.defaultBranch;
-    // Return mock file content
-    sendJson(res, 200, {
-      type: 'file',
-      encoding: 'base64',
-      size: 100,
-      name: filePath.split('/').pop() || filePath,
-      path: filePath,
-      content: Buffer.from('mock content').toString('base64'),
-      sha: 'a'.repeat(40),
-    });
+    
+    // Try to get as file first
+    const fileResult = storage.getFileContent(repo.id, filePath, ref);
+    if (fileResult) {
+      sendJson(res, 200, {
+        type: 'file',
+        encoding: 'base64',
+        size: fileResult.size,
+        name: filePath.split('/').pop() || filePath,
+        path: filePath,
+        content: Buffer.from(fileResult.content).toString('base64'),
+        sha: fileResult.sha,
+      });
+      return true;
+    }
+    
+    // Try as directory
+    const dirResult = storage.getDirectoryContent(repo.id, filePath, ref);
+    if (dirResult !== null) {
+      sendJson(res, 200, dirResult);
+      return true;
+    }
+    
+    sendError(res, 404, 'Not Found');
     return true;
   }
   
@@ -318,8 +346,24 @@ export function handleContents(req: IncomingMessage, res: ServerResponse): boole
         sendError(res, 422, 'Validation Failed');
         return;
       }
-      const commitSha = 'c'.repeat(40);
-      sendJson(res, 200, { commit: { sha: commitSha } });
+      
+      try {
+        const commitSha = storage.deleteFileContent(repo.id, filePath, message, sha, branch);
+        if (!commitSha) {
+          sendError(res, 404, 'Not Found');
+          return;
+        }
+        sendJson(res, 200, { commit: { sha: commitSha } });
+      } catch (err) {
+        if (err instanceof Error && err.message === 'SHA_CONFLICT') {
+          sendJson(res, 409, {
+            message: 'sha does not match',
+            documentation_url: 'https://docs.github.com/rest/repos/contents#delete-file-contents',
+          });
+        } else {
+          sendError(res, 500, 'Internal Server Error');
+        }
+      }
     }).catch(() => sendError(res, 400, 'Malformed JSON'));
     return true;
   }
@@ -421,7 +465,20 @@ export function handleIssues(req: IncomingMessage, res: ServerResponse): boolean
     const state = url.searchParams.get('state') || 'open';
     const sort = url.searchParams.get('sort') || 'created';
     const direction = url.searchParams.get('direction') || 'desc';
-    const issues = storage.listIssues(repo.id, state, sort, direction);
+    const perPage = Math.min(parseInt(url.searchParams.get('per_page') || '30', 10), 100);
+    const page = parseInt(url.searchParams.get('page') || '1', 10);
+    
+    const allIssues = storage.listIssues(repo.id, state, sort, direction);
+    const startIdx = (page - 1) * perPage;
+    const issues = allIssues.slice(startIdx, startIdx + perPage);
+    
+    const headers: Record<string, string> = {};
+    if (startIdx + perPage < allIssues.length) {
+      const nextPage = page + 1;
+      const nextUrl = `${url.origin}/api/v3/repos/${owner}/${repoName}/issues?state=${state}&sort=${sort}&direction=${direction}&page=${nextPage}&per_page=${perPage}`;
+      headers['link'] = `<${nextUrl}>; rel="next"`;
+    }
+    
     sendJson(res, 200, issues.map(issue => ({
       id: issue.id,
       number: issue.number,
@@ -433,7 +490,7 @@ export function handleIssues(req: IncomingMessage, res: ServerResponse): boolean
       updated_at: issue.updatedAt,
       closed_at: issue.closedAt,
       user: { login: user.login, id: user.id },
-    })));
+    })), headers);
     return true;
   }
   
@@ -581,7 +638,20 @@ export function handlePulls(req: IncomingMessage, res: ServerResponse): boolean 
     // GET /repos/{owner}/{repo}/pulls
     const url = new URL(req.url ?? '', 'http://localhost');
     const state = url.searchParams.get('state') || 'open';
-    const prs = storage.getPullRequests(repo.id).filter(pr => state === 'all' || pr.state === state);
+    const perPage = Math.min(parseInt(url.searchParams.get('per_page') || '30', 10), 100);
+    const page = parseInt(url.searchParams.get('page') || '1', 10);
+    
+    const allPrs = storage.getPullRequests(repo.id).filter(pr => state === 'all' || pr.state === state);
+    const startIdx = (page - 1) * perPage;
+    const prs = allPrs.slice(startIdx, startIdx + perPage);
+    
+    const headers: Record<string, string> = {};
+    if (startIdx + perPage < allPrs.length) {
+      const nextPage = page + 1;
+      const nextUrl = `${url.origin}/api/v3/repos/${owner}/${repoName}/pulls?state=${state}&page=${nextPage}&per_page=${perPage}`;
+      headers['link'] = `<${nextUrl}>; rel="next"`;
+    }
+    
     sendJson(res, 200, prs.map(pr => ({
       id: pr.id,
       number: pr.number,
@@ -596,7 +666,7 @@ export function handlePulls(req: IncomingMessage, res: ServerResponse): boolean 
       created_at: pr.createdAt,
       updated_at: pr.updatedAt,
       user: { login: user.login, id: user.id },
-    })));
+    })), headers);
     return true;
   }
   
@@ -644,6 +714,10 @@ export function handlePulls(req: IncomingMessage, res: ServerResponse): boolean 
           }
           return;
         }
+        if ('conflict' in result && result.conflict) {
+          sendError(res, 405, 'Pull request is not mergeable');
+          return;
+        }
         sendJson(res, 200, {
           sha: result.sha,
           merged: true,
@@ -663,18 +737,41 @@ export function handlePulls(req: IncomingMessage, res: ServerResponse): boolean 
         sendError(res, 404, 'Not Found');
         return true;
       }
-      // Return mock file list
-      sendJson(res, 200, [{
-        filename: 'mock.txt',
-        status: 'modified',
-        additions: 1,
-        deletions: 1,
-        changes: 2,
-        blob_url: `https://github.com/${owner}/${repoName}/blob/${pr.head.sha}/mock.txt`,
-        raw_url: `https://github.com/${owner}/${repoName}/raw/${pr.head.sha}/mock.txt`,
-        contents_url: `https://api.github.com/repos/${owner}/${repoName}/contents/mock.txt?ref=${pr.head.ref}`,
-        patch: '@@ -1 +1 @@\n-old\n+new',
-      }]);
+      
+      // Get base and head commit trees
+      const headRef = storage.getRef(repo.owner, repo.name, `refs/heads/${pr.head.ref}`);
+      const baseRef = storage.getRef(repo.owner, repo.name, `refs/heads/${pr.base.ref}`);
+      if (!headRef || !baseRef) {
+        sendError(res, 404, 'Not Found');
+        return true;
+      }
+      
+      const headCommitObj = storage.getObject(headRef.sha);
+      const baseCommitObj = storage.getObject(baseRef.sha);
+      if (!headCommitObj || !baseCommitObj) {
+        sendError(res, 404, 'Not Found');
+        return true;
+      }
+      
+      const headCommit = storage.parseCommit(headCommitObj.data);
+      const baseCommit = storage.parseCommit(baseCommitObj.data);
+      
+      // Get diff between base and head
+      const diff = storage.getDiffBetweenTrees(baseCommit.tree, headCommit.tree);
+      
+      const files = diff.map(d => ({
+        filename: d.filename,
+        status: d.status,
+        additions: d.additions,
+        deletions: d.deletions,
+        changes: d.changes,
+        blob_url: `https://github.com/${owner}/${repoName}/blob/${pr.head.sha}/${d.filename}`,
+        raw_url: `https://github.com/${owner}/${repoName}/raw/${pr.head.sha}/${d.filename}`,
+        contents_url: `https://api.github.com/repos/${owner}/${repoName}/contents/${d.filename}?ref=${pr.head.ref}`,
+        patch: `@@ -1 +1 @@\n-old\n+new`, // Simplified patch
+      }));
+      
+      sendJson(res, 200, files);
       return true;
     }
   }
@@ -758,12 +855,69 @@ export function handleCommits(req: IncomingMessage, res: ServerResponse): boolea
   if (req.method === 'GET') {
     const url = new URL(req.url ?? '', 'http://localhost');
     const sha = url.searchParams.get('sha') || repo.defaultBranch;
-    // Return mock commits
-    sendJson(res, 200, [{
-      sha: 'a'.repeat(40),
-      commit: { message: 'Initial commit' },
-      author: { login: user.login, id: user.id },
-    }]);
+    const perPage = Math.min(parseInt(url.searchParams.get('per_page') || '30', 10), 100);
+    const page = parseInt(url.searchParams.get('page') || '1', 10);
+    
+    // Get commit SHA for the ref
+    const refObj = storage.getRef(owner, repoName, `refs/heads/${sha}`);
+    const commitSha = refObj?.sha || sha;
+    
+    if (commitSha === '0'.repeat(40) || !storage.getObject(commitSha)) {
+      sendJson(res, 200, []);
+      return true;
+    }
+    
+    // Walk commit history
+    const commits = [];
+    let currentSha = commitSha;
+    let count = 0;
+    const maxCommits = page * perPage;
+    const startIdx = (page - 1) * perPage;
+    
+    while (currentSha && currentSha !== '0'.repeat(40) && count < maxCommits) {
+      const commitObj = storage.getObject(currentSha);
+      if (!commitObj || commitObj.type !== 'commit') break;
+      
+      const commit = storage.parseCommit(commitObj.data);
+      
+      if (count >= startIdx) {
+        commits.push({
+          sha: currentSha,
+          commit: {
+            message: commit.message,
+            author: {
+              name: commit.author.split(' <')[0],
+              email: commit.author.match(/<(.+)>/)?.[1] || '',
+              date: commit.author.match(/> (.+) \+/)?.[1] || '',
+            },
+            committer: {
+              name: commit.committer.split(' <')[0],
+              email: commit.committer.match(/<(.+)>/)?.[1] || '',
+              date: commit.committer.match(/> (.+) \+/)?.[1] || '',
+            },
+          },
+          author: { login: user.login, id: user.id },
+          parents: commit.parents.map(p => ({ sha: p })),
+        });
+      }
+      
+      count++;
+      if (commit.parents.length > 0) {
+        currentSha = commit.parents[0];
+      } else {
+        break;
+      }
+    }
+    
+    // Pagination headers
+    const headers: Record<string, string> = {};
+    if (count > startIdx + perPage) {
+      const nextPage = page + 1;
+      const nextUrl = `${url.origin}/api/v3/repos/${owner}/${repoName}/commits?sha=${sha}&page=${nextPage}&per_page=${perPage}`;
+      headers['link'] = `<${nextUrl}>; rel="next"`;
+    }
+    
+    sendJson(res, 200, commits, headers);
     return true;
   }
   

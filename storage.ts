@@ -2,6 +2,8 @@
 
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
+import { buildScenario, scenarioRng, SCENARIO_EPOCH_SEC } from './scenario.ts';
+import type { ScenarioUser, ScenarioRepo, ScenarioBlob, ScenarioCommit, ScenarioIssue, ScenarioPull } from './scenario.ts';
 
 export const DEFAULT_BRANCH = 'main';
 
@@ -125,6 +127,168 @@ class Storage {
   private nextCommentId = 1;
   private issueCounters = new Map<number, number>(); // key: repoId
   private prCounters = new Map<number, number>(); // key: repoId
+  private commitCounters = new Map<number, number>(); // key: repoId
+
+  // Seed the store from the scenario
+  seedStore(): void {
+    const scenario = buildScenario();
+    
+    // Create users (token -> user mapping)
+    for (const user of scenario.users) {
+      this.users.set(user.login, user);
+    }
+    
+    // Create all repositories
+    const allRepos = [...scenario.repos, ...scenario.orgRepos, ...scenario.strangerRepos];
+    for (const repo of allRepos) {
+      const key = `${repo.owner}/${repo.name}`;
+      if (!this.repos.has(key)) {
+        const now = scenario.commits[0]?.iso || new Date(SCENARIO_EPOCH_SEC * 1000).toISOString();
+        const newRepo: Repository = {
+          id: repo.id,
+          owner: repo.owner,
+          name: repo.name,
+          fullName: repo.fullName,
+          description: repo.description,
+          private: repo.private,
+          defaultBranch: repo.defaultBranch,
+          createdAt: now,
+          updatedAt: now,
+        };
+        this.repos.set(key, newRepo);
+        this.refs.set(key, [{ name: `refs/heads/${repo.defaultBranch}`, sha: '0'.repeat(40) }]);
+        this.issues.set(repo.id, []);
+        this.labels.set(repo.id, []);
+        this.pullRequests.set(repo.id, []);
+        // comments map uses issueId as key, initialized lazily
+        this.issueCounters.set(repo.id, 0);
+        this.prCounters.set(repo.id, 0);
+        this.commitCounters.set(repo.id, 0);
+      }
+    }
+    
+    // For each repo, build the commit history from scenario.commits
+    // We need to create blobs, trees, and commits for each repo
+    for (const repo of allRepos) {
+      this.seedRepoCommits(repo, scenario);
+    }
+    
+    // Seed branches (additional branches beyond default)
+    const branchRng = scenarioRng("branches");
+    // Note: branches are already in scenario.branches
+    for (const repo of allRepos) {
+      for (const branchName of scenario.branches) {
+        if (branchName !== repo.defaultBranch && !branchName.startsWith('refs/')) {
+          const refName = `refs/heads/${branchName}`;
+          const existingRef = this.getRef(repo.owner, repo.name, refName);
+          if (!existingRef) {
+            // Point to the default branch tip (last commit)
+            const defaultRef = this.getRef(repo.owner, repo.name, `refs/heads/${repo.defaultBranch}`);
+            if (defaultRef && defaultRef.sha !== '0'.repeat(40)) {
+              this.setRef(repo.owner, repo.name, refName, defaultRef.sha);
+            }
+          }
+        }
+      }
+    }
+    
+    // Seed issues with labels/state
+    for (let i = 0; i < scenario.issues.length; i++) {
+      const issueTemplate = scenario.issues[i];
+      // Distribute issues across viewer's repos
+      const repo = scenario.repos[i % scenario.repos.length];
+      const repoObj = this.getRepo(repo.owner, repo.name);
+      if (repoObj) {
+        // Create labels if they don't exist
+        for (const labelName of issueTemplate.labels) {
+          const existingLabels = this.getLabels(repoObj.id);
+          if (!existingLabels.some(l => l.name === labelName)) {
+            this.createLabel(repoObj.id, labelName, 'ededed');
+          }
+        }
+        const issue = this.createIssue(repoObj.id, issueTemplate.title, issueTemplate.body, issueTemplate.labels);
+        // Note: scenario issues don't have state, they're all open by default
+      }
+    }
+    
+    // Seed pull requests
+    for (let i = 0; i < scenario.pulls.length; i++) {
+      const pullTemplate = scenario.pulls[i];
+      // Distribute pulls across viewer's repos
+      const repo = scenario.repos[i % scenario.repos.length];
+      const repoObj = this.getRepo(repo.owner, repo.name);
+      if (repoObj) {
+        // Ensure head branch exists
+        const headRefName = `refs/heads/${pullTemplate.head}`;
+        const headRef = this.getRef(repo.owner, repo.name, headRefName);
+        if (!headRef) {
+          const baseRef = this.getRef(repo.owner, repo.name, `refs/heads/${pullTemplate.base}`);
+          if (baseRef) {
+            this.setRef(repo.owner, repo.name, headRefName, baseRef.sha);
+          }
+        }
+        // Create the pull request
+        try {
+          this.createPullRequest(repoObj.id, pullTemplate.title, pullTemplate.body, pullTemplate.head, pullTemplate.base);
+        } catch {
+          // Ignore if branch not found
+        }
+      }
+    }
+  }
+
+  private seedRepoCommits(repo: ScenarioRepo, scenario: { commits: ScenarioCommit[]; blobs: ScenarioBlob[]; filePaths: string[]; users: ScenarioUser[] }): void {
+    const key = `${repo.owner}/${repo.name}`;
+    const refs = this.refs.get(key) || [];
+    const defaultBranchRef = refs.find(r => r.name === `refs/heads/${repo.defaultBranch}`);
+    if (!defaultBranchRef) return;
+    
+    // Create blobs from scenario
+    const blobShaMap = new Map<string, string>();
+    for (const blob of scenario.blobs) {
+      const content = Buffer.from(blob.content, 'utf8');
+      const sha = this.createBlob(content);
+      blobShaMap.set(blob.path, sha);
+    }
+    
+    // Create commits on the default branch
+    let currentTreeSha = '';
+    let parentSha = '0'.repeat(40);
+    
+    for (let i = 0; i < scenario.commits.length; i++) {
+      const commitTemplate = scenario.commits[i];
+      
+      // Create a tree with some files (use a subset of blobs)
+      const treeEntries: TreeEntry[] = [];
+      const filesPerCommit = 3;
+      const startIdx = (i * filesPerCommit) % scenario.blobs.length;
+      for (let j = 0; j < filesPerCommit; j++) {
+        const blobIdx = (startIdx + j) % scenario.blobs.length;
+        const blob = scenario.blobs[blobIdx];
+        const sha = blobShaMap.get(blob.path);
+        if (sha) {
+          treeEntries.push({ mode: '100644', name: blob.path, sha });
+        }
+      }
+      
+      const treeSha = this.createTree(treeEntries);
+      currentTreeSha = treeSha;
+      
+      const commitData: CommitData = {
+        tree: treeSha,
+        parents: parentSha === '0'.repeat(40) ? [] : [parentSha],
+        author: `${commitTemplate.author.name} <${commitTemplate.author.email}> ${commitTemplate.epochSec} +0000`,
+        committer: `${commitTemplate.author.name} <${commitTemplate.author.email}> ${commitTemplate.epochSec} +0000`,
+        message: commitTemplate.message,
+      };
+      
+      const commitSha = this.createCommit(commitData);
+      parentSha = commitSha;
+      
+      // Update the default branch ref to point to this commit
+      this.setRef(repo.owner, repo.name, `refs/heads/${repo.defaultBranch}`, commitSha);
+    }
+  }
 
   // User management
   getUserByToken(token: string): User | null {
@@ -486,32 +650,89 @@ class Storage {
     return repoPrs.find(p => p.number === number) || null;
   }
 
-  mergePullRequest(repoId: number, number: number, mergeMethod: 'squash' | 'merge' | 'rebase' = 'squash'): { sha: string; message: string } | null {
+  mergePullRequest(repoId: number, number: number, mergeMethod: 'squash' | 'merge' | 'rebase' = 'squash'): { sha: string; message: string } | { conflict: true } | null {
     const pr = this.getPullRequest(repoId, number);
     if (!pr) return null;
-    if (pr.state !== 'open') return null; // 405 conflict
+    if (pr.state !== 'open') return { conflict: true }; // 405 conflict
     
     const repo = this.getRepoById(repoId);
     if (!repo) return null;
     
-    // For squash merge, create a new commit on the base branch
+    // Get head and base commit SHAs
+    const headRef = this.getRef(repo.owner, repo.name, `refs/heads/${pr.head.ref}`);
     const baseRef = this.getRef(repo.owner, repo.name, `refs/heads/${pr.base.ref}`);
-    if (!baseRef) return null;
+    if (!headRef || !baseRef) return null;
     
-    // Create a commit with the PR title as message
+    // Check if head is already merged into base (fast-forward check)
+    // For conflict detection, we need to see if the base has commits that head doesn't have
+    // and if head has changes that conflict with base
+    const headCommitSha = headRef.sha;
+    const baseCommitSha = baseRef.sha;
+    
+    // Get commit objects
+    const headCommitObj = this.getObject(headCommitSha);
+    const baseCommitObj = this.getObject(baseCommitSha);
+    if (!headCommitObj || !baseCommitObj) return null;
+    
+    const headCommit = this.parseCommit(headCommitObj.data);
+    const baseCommit = this.parseCommit(baseCommitObj.data);
+    
+    // Check if base is ancestor of head (no conflict, can fast-forward)
+    // For simplicity, we'll check if the trees are different
+    const headTreeSha = headCommit.tree;
+    const baseTreeSha = baseCommit.tree;
+    
+    // If trees are the same, no changes to merge
+    if (headTreeSha === baseTreeSha) {
+      // Already up to date
+      pr.state = 'merged';
+      pr.merged = true;
+      pr.mergeCommitSha = baseCommitSha;
+      pr.mergedAt = new Date().toISOString();
+      pr.updatedAt = pr.mergedAt;
+      return { sha: baseCommitSha, message: 'Pull request merged (already up to date)' };
+    }
+    
+    // For conflict detection, we need to check if there are conflicting changes
+    // We'll do a simple check: if base has commits not in head's history that modify the same files
+    // For now, we'll check if the merge base (common ancestor) has the same tree as base
+    // If not, there might be conflicts
+    
+    // Find merge base (simplified: just use base's parent if head's parent includes base)
+    // For proper implementation, we'd need full ancestry walk
+    
+    // Check if base is ancestor of head
+    const isBaseAncestorOfHead = this.isAncestor(baseCommitSha, headCommitSha);
+    
+    if (!isBaseAncestorOfHead) {
+      // Base has commits that head doesn't have - potential conflict
+      // Check if there are conflicting file changes
+      const headFiles = this.getFilesInTree(headTreeSha);
+      const baseFiles = this.getFilesInTree(baseTreeSha);
+      
+      // Check for conflicts: files modified in both branches since merge base
+      // Simplified: if any file exists in both with different content, it's a conflict
+      for (const [path, headSha] of headFiles) {
+        const baseSha = baseFiles.get(path);
+        if (baseSha && baseSha !== headSha) {
+          // File modified in both - check if they have a common ancestor
+          // For simplicity, we'll consider this a conflict if base is not ancestor of head
+          return { conflict: true };
+        }
+      }
+    }
+    
+    // Perform squash merge: create a new commit on base branch with head's tree
+    // The squash commit should have the combined changes
+    const newTreeSha = headTreeSha; // For squash, we take the head's tree as-is
+    
     const commitData: CommitData = {
-      tree: '', // Would need to compute tree from PR changes
-      parents: [baseRef.sha],
+      tree: newTreeSha,
+      parents: [baseCommitSha],
       author: `Conformance <conformance@make.fun> ${Math.floor(Date.now() / 1000)} +0000`,
       committer: `Conformance <conformance@make.fun> ${Math.floor(Date.now() / 1000)} +0000`,
       message: pr.title + '\n',
     };
-    
-    // For now, we'll create a simple commit. In a real implementation,
-    // we'd need to compute the actual tree from the PR's changes.
-    const treeEntries: TreeEntry[] = [];
-    const treeSha = this.createTree(treeEntries);
-    commitData.tree = treeSha;
     
     const mergeSha = this.createCommit(commitData);
     
@@ -526,6 +747,80 @@ class Storage {
     pr.updatedAt = pr.mergedAt;
     
     return { sha: mergeSha, message: 'Pull request merged' };
+  }
+  
+  // Helper: check if commit A is ancestor of commit B
+  private isAncestor(ancestorSha: string, descendantSha: string): boolean {
+    if (ancestorSha === descendantSha) return true;
+    
+    const visited = new Set<string>();
+    const queue = [descendantSha];
+    
+    while (queue.length > 0) {
+      const currentSha = queue.shift()!;
+      if (visited.has(currentSha)) continue;
+      visited.add(currentSha);
+      
+      if (currentSha === ancestorSha) return true;
+      
+      const commitObj = this.getObject(currentSha);
+      if (!commitObj || commitObj.type !== 'commit') continue;
+      
+      const commit = this.parseCommit(commitObj.data);
+      for (const parent of commit.parents) {
+        if (!visited.has(parent)) queue.push(parent);
+      }
+    }
+    
+    return false;
+  }
+  
+  // Helper: get all files in a tree (path -> blob sha)
+  private getFilesInTree(treeSha: string): Map<string, string> {
+    const files = new Map<string, string>();
+    
+    const collect = (currentTreeSha: string, prefix: string) => {
+      const entries = this.getTreeEntries(currentTreeSha);
+      for (const entry of entries) {
+        const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.mode === '40000') {
+          collect(entry.sha, path);
+        } else {
+          files.set(path, entry.sha);
+        }
+      }
+    };
+    
+    collect(treeSha, '');
+    return files;
+  }
+  
+  // Helper: compute diff between two trees (for PR files list)
+  getDiffBetweenTrees(baseTreeSha: string, headTreeSha: string): Array<{ filename: string; status: string; additions: number; deletions: number; changes: number }> {
+    const baseFiles = this.getFilesInTree(baseTreeSha);
+    const headFiles = this.getFilesInTree(headTreeSha);
+    
+    const allPaths = new Set([...baseFiles.keys(), ...headFiles.keys()]);
+    const diff: Array<{ filename: string; status: string; additions: number; deletions: number; changes: number }> = [];
+    
+    for (const path of allPaths) {
+      const baseSha = baseFiles.get(path);
+      const headSha = headFiles.get(path);
+      
+      if (!baseSha && headSha) {
+        // Added
+        diff.push({ filename: path, status: 'added', additions: 1, deletions: 0, changes: 1 });
+      } else if (baseSha && !headSha) {
+        // Deleted
+        diff.push({ filename: path, status: 'removed', additions: 0, deletions: 1, changes: 1 });
+      } else if (baseSha !== headSha) {
+        // Modified
+        diff.push({ filename: path, status: 'modified', additions: 1, deletions: 1, changes: 2 });
+      }
+      // If same, no change
+    }
+    
+    return diff;
   }
 
   // Comment operations
@@ -548,22 +843,336 @@ class Storage {
     return comment;
   }
 
+  // Helper: get tree entries from a commit SHA
+  private getTreeEntries(treeSha: string): TreeEntry[] {
+    const treeObj = this.getObject(treeSha);
+    if (!treeObj || treeObj.type !== 'tree') return [];
+    return this.parseTree(treeObj.data);
+  }
+
+  // Helper: find file in tree recursively
+  private findFileInTree(treeSha: string, path: string): { entry: TreeEntry; treeSha: string } | null {
+    const parts = path.split('/');
+    let currentTreeSha = treeSha;
+    
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      const entries = this.getTreeEntries(currentTreeSha);
+      const entry = entries.find(e => e.name === part);
+      if (!entry) return null;
+      
+      if (i === parts.length - 1) {
+        // This is the file we're looking for
+        if (entry.mode === '40000') return null; // It's a directory
+        return { entry, treeSha: currentTreeSha };
+      } else {
+        // Navigate into subdirectory
+        if (entry.mode !== '40000') return null; // Not a directory
+        currentTreeSha = entry.sha;
+      }
+    }
+    return null;
+  }
+
+  // Helper: get commit SHA for a ref (branch)
+  private getCommitShaForRef(owner: string, repo: string, ref: string): string | null {
+    const refObj = this.getRef(owner, repo, `refs/heads/${ref}`);
+    if (refObj) return refObj.sha;
+    // Try tag refs
+    const tagRef = this.getRef(owner, repo, `refs/tags/${ref}`);
+    if (tagRef) {
+      const tagObj = this.getObject(tagRef.sha);
+      if (tagObj && tagObj.type === 'tag') {
+        const text = tagObj.data.toString('utf8');
+        const lines = text.split('\n');
+        for (const line of lines) {
+          if (line.startsWith('object ')) {
+            const objSha = line.slice(7);
+            const obj = this.getObject(objSha);
+            if (obj && obj.type === 'commit') return objSha;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  // Helper: build tree from current tree with a file added/updated/deleted
+  private buildTreeWithChange(baseTreeSha: string, path: string, blobSha: string | null, mode: string = '100644'): string {
+    const parts = path.split('/');
+    
+    // Recursive function to build tree from bottom up
+    const buildTreeRecursive = (treeSha: string, depth: number): string => {
+      const entries = this.getTreeEntries(treeSha);
+      const part = parts[depth];
+      
+      if (depth === parts.length - 1) {
+        // This is the level where we make the change
+        const newEntries = entries.filter(e => e.name !== part);
+        if (blobSha !== null) {
+          newEntries.push({ mode, name: part, sha: blobSha });
+        }
+        return this.createTree(newEntries);
+      } else {
+        // Navigate into subdirectory
+        const subdirEntry = entries.find(e => e.name === part && e.mode === '40000');
+        if (!subdirEntry) {
+          // Create new subdirectory tree
+          const newSubtreeSha = this.createTree([]);
+          const newEntries = [...entries.filter(e => e.name !== part), { mode: '40000', name: part, sha: newSubtreeSha }];
+          return this.buildTreeWithChangeRecursive(newEntries, depth + 1);
+        }
+        const newSubtreeSha = this.buildTreeWithChange(subdirEntry.sha, path, blobSha, mode);
+        const newEntries = entries.map(e => e.name === part ? { ...e, sha: newSubtreeSha } : e);
+        return this.createTree(newEntries);
+      }
+    };
+    
+    // Helper for creating new subdirectories
+    const buildTreeRecursiveNew = (entries: TreeEntry[], depth: number): string => {
+      if (depth === parts.length - 1) {
+        const newEntries = [...entries];
+        if (blobSha !== null) {
+          newEntries.push({ mode, name: parts[depth], sha: blobSha });
+        }
+        return this.createTree(newEntries);
+      } else {
+        const newSubtreeSha = this.createTree([]);
+        const newEntries = [...entries, { mode: '40000', name: parts[depth], sha: newSubtreeSha }];
+        return buildTreeRecursiveNew(newEntries, depth + 1);
+      }
+    };
+    
+    // Actually we need a simpler approach - let's build from root
+    return this.buildTreeFromRoot(baseTreeSha, path, blobSha, mode);
+  }
+
+  private buildTreeFromRoot(baseTreeSha: string, path: string, blobSha: string | null, mode: string = '100644'): string {
+    const parts = path.split('/');
+    
+    // Get all entries from base tree
+    const baseEntries = this.getTreeEntries(baseTreeSha);
+    
+    // We'll build a map of path -> (mode, sha) for all files in the tree
+    const fileMap = new Map<string, { mode: string; sha: string }>();
+    
+    // Recursively collect all files
+    const collectFiles = (treeSha: string, prefix: string) => {
+      const entries = this.getTreeEntries(treeSha);
+      for (const entry of entries) {
+        const fullPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.mode === '40000') {
+          collectFiles(entry.sha, fullPath);
+        } else {
+          fileMap.set(fullPath, { mode: entry.mode, sha: entry.sha });
+        }
+      }
+    };
+    
+    collectFiles(baseTreeSha, '');
+    
+    // Apply the change
+    if (blobSha !== null) {
+      fileMap.set(path, { mode, sha: blobSha });
+    } else {
+      fileMap.delete(path);
+    }
+    
+    // Now rebuild the tree from the file map
+    return this.buildTreeFromFileMap(fileMap);
+  }
+  
+  private buildTreeFromFileMap(fileMap: Map<string, { mode: string; sha: string }>): string {
+    // Group files by directory
+    const dirMap = new Map<string, TreeEntry[]>();
+    
+    for (const [path, { mode, sha }] of fileMap) {
+      const parts = path.split('/');
+      const dirPath = parts.slice(0, -1).join('/');
+      const fileName = parts[parts.length - 1];
+      
+      if (!dirMap.has(dirPath)) {
+        dirMap.set(dirPath, []);
+      }
+      dirMap.get(dirPath)!.push({ mode, name: fileName, sha });
+    }
+    
+    // Build trees bottom-up
+    const treeCache = new Map<string, string>();
+    
+    // Sort directories by depth (deepest first)
+    const sortedDirs = Array.from(dirMap.keys()).sort((a, b) => {
+      const aDepth = a ? a.split('/').length : 0;
+      const bDepth = b ? b.split('/').length : 0;
+      return bDepth - aDepth;
+    });
+    
+    for (const dirPath of sortedDirs) {
+      const entries = dirMap.get(dirPath)!;
+      const treeSha = this.createTree(entries);
+      treeCache.set(dirPath, treeSha);
+      
+      // Add this tree to parent directory
+      if (dirPath) {
+        const parts = dirPath.split('/');
+        const parentPath = parts.slice(0, -1).join('/');
+        const dirName = parts[parts.length - 1];
+        
+        if (!dirMap.has(parentPath)) {
+          dirMap.set(parentPath, []);
+        }
+        dirMap.get(parentPath)!.push({ mode: '40000', name: dirName, sha: treeSha });
+      }
+    }
+    
+    // Root tree
+    const rootEntries = dirMap.get('') || [];
+    return this.createTree(rootEntries);
+  }
+
+  // Helper: get commit tree SHA
+  private getCommitTreeSha(commitSha: string): string | null {
+    const commitObj = this.getObject(commitSha);
+    if (!commitObj || commitObj.type !== 'commit') return null;
+    const commit = this.parseCommit(commitObj.data);
+    return commit.tree;
+  }
+
   // Contents API
   getFileContent(repoId: number, path: string, ref?: string): { content: string; sha: string; size: number } | null {
-    // This is a simplified implementation - in reality we'd need to traverse the git tree
-    // For the conformance tests, we need to return the file that was PUT
-    // This will be implemented when we integrate with git object storage
-    return null;
+    const repo = this.getRepoById(repoId);
+    if (!repo) return null;
+    
+    const refName = ref || repo.defaultBranch;
+    const commitSha = this.getCommitShaForRef(repo.owner, repo.name, refName);
+    if (!commitSha) return null;
+    
+    const treeSha = this.getCommitTreeSha(commitSha);
+    if (!treeSha) return null;
+    
+    const result = this.findFileInTree(treeSha, path);
+    if (!result) return null;
+    
+    const blobObj = this.getObject(result.entry.sha);
+    if (!blobObj || blobObj.type !== 'blob') return null;
+    
+    const content = blobObj.data.toString('utf8');
+    return {
+      content,
+      sha: result.entry.sha,
+      size: blobObj.data.length,
+    };
+  }
+
+  getDirectoryContent(repoId: number, path: string, ref?: string): ContentEntry[] | null {
+    const repo = this.getRepoById(repoId);
+    if (!repo) return null;
+    
+    const refName = ref || repo.defaultBranch;
+    const commitSha = this.getCommitShaForRef(repo.owner, repo.name, refName);
+    if (!commitSha) return null;
+    
+    const treeSha = this.getCommitTreeSha(commitSha);
+    if (!treeSha) return null;
+    
+    let targetTreeSha = treeSha;
+    if (path) {
+      const result = this.findFileInTree(treeSha, path);
+      if (!result || result.entry.mode !== '40000') return null;
+      targetTreeSha = result.entry.sha;
+    }
+    
+    const entries = this.getTreeEntries(targetTreeSha);
+    return entries.map(entry => ({
+      type: entry.mode === '40000' ? 'dir' : 'file',
+      name: entry.name,
+      path: path ? `${path}/${entry.name}` : entry.name,
+      sha: entry.sha,
+      size: entry.mode === '40000' ? undefined : (this.getObject(entry.sha)?.data.length ?? 0),
+    }));
   }
 
   putFileContent(repoId: number, path: string, content: string, message: string, branch?: string, sha?: string): { contentSha: string; commitSha: string } | null {
-    // This will be implemented with git object storage
-    return null;
+    const repo = this.getRepoById(repoId);
+    if (!repo) return null;
+    
+    const refName = branch || repo.defaultBranch;
+    const commitSha = this.getCommitShaForRef(repo.owner, repo.name, refName);
+    if (!commitSha) return null;
+    
+    // If sha provided, verify it matches current file content
+    if (sha) {
+      const current = this.getFileContent(repoId, path, refName);
+      if (!current || current.sha !== sha) {
+        // Stale SHA - 409 conflict
+        throw new Error('SHA_CONFLICT');
+      }
+    }
+    
+    // Create blob
+    const blobData = Buffer.from(content, 'utf8');
+    const blobSha = this.createBlob(blobData);
+    
+    // Get base tree
+    const baseTreeSha = this.getCommitTreeSha(commitSha);
+    if (!baseTreeSha) return null;
+    
+    // Create new tree with the file added/updated
+    const newTreeSha = this.buildTreeFromRoot(baseTreeSha, path, blobSha, '100644');
+    
+    // Create commit
+    const commitData: CommitData = {
+      tree: newTreeSha,
+      parents: [commitSha],
+      author: `Conformance <conformance@make.fun> ${Math.floor(Date.now() / 1000)} +0000`,
+      committer: `Conformance <conformance@make.fun> ${Math.floor(Date.now() / 1000)} +0000`,
+      message: message + '\n',
+    };
+    
+    const newCommitSha = this.createCommit(commitData);
+    
+    // Update the branch ref
+    this.setRef(repo.owner, repo.name, `refs/heads/${refName}`, newCommitSha);
+    
+    return { contentSha: blobSha, commitSha: newCommitSha };
   }
 
   deleteFileContent(repoId: number, path: string, message: string, sha: string, branch?: string): string | null {
-    // This will be implemented with git object storage
-    return null;
+    const repo = this.getRepoById(repoId);
+    if (!repo) return null;
+    
+    const refName = branch || repo.defaultBranch;
+    const commitSha = this.getCommitShaForRef(repo.owner, repo.name, refName);
+    if (!commitSha) return null;
+    
+    // Verify SHA matches
+    const current = this.getFileContent(repoId, path, refName);
+    if (!current || current.sha !== sha) {
+      throw new Error('SHA_CONFLICT');
+    }
+    
+    // Get base tree
+    const baseTreeSha = this.getCommitTreeSha(commitSha);
+    if (!baseTreeSha) return null;
+    
+    // Create new tree with the file removed
+    const newTreeSha = this.buildTreeFromRoot(baseTreeSha, path, null);
+    
+    // Create commit
+    const commitData: CommitData = {
+      tree: newTreeSha,
+      parents: [commitSha],
+      author: `Conformance <conformance@make.fun> ${Math.floor(Date.now() / 1000)} +0000`,
+      committer: `Conformance <conformance@make.fun> ${Math.floor(Date.now() / 1000)} +0000`,
+      message: message + '\n',
+    };
+    
+    const newCommitSha = this.createCommit(commitData);
+    
+    // Update the branch ref
+    this.setRef(repo.owner, repo.name, `refs/heads/${refName}`, newCommitSha);
+    
+    return newCommitSha;
   }
 }
 

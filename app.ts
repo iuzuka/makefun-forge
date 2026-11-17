@@ -34,6 +34,9 @@ import {
 } from './git.ts';
 import type { GitPacket, AdvertisedRef, PushCommand, PushReport, GitObject } from './git.ts';
 
+// Seed the store on startup
+storage.seedStore();
+
 const JSON_TYPE = 'application/json; charset=utf-8';
 
 function pathOf(req: IncomingMessage): string {
@@ -48,7 +51,10 @@ function getAuthUser(req: IncomingMessage): { login: string } | null {
   const auth = req.headers.authorization;
   if (!auth || !auth.startsWith('Bearer ')) return null;
   const token = auth.slice('Bearer '.length);
-  return { login: token };
+  // The token IS the login (MAKEFUN_SHOP_TOKEN = viewer's login)
+  const user = storage.getUserByToken(token);
+  if (!user) return null;
+  return { login: user.login };
 }
 
 export function createApp(): Server {
