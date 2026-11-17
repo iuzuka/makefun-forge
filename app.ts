@@ -178,7 +178,7 @@ export function createApp(): Server {
           sendJson(res, 400, { message: 'Invalid request body' });
           return;
         }
-        const answer = handleMcpRequest(storage, mcpUser, req.method ?? 'POST', bodyText);
+        const answer = await handleMcpRequest(storage, mcpUser, req.method ?? 'POST', bodyText);
         if (answer !== false) {
           sendJson(res, answer.status, answer.body);
           return;
