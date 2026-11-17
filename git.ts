@@ -745,8 +745,10 @@ export function formatRefsAdvertisementV0(refs: Ref[], service: string, capabili
   const visible = refs.filter((ref) => ref.sha !== ZERO_OID);
   let body = '';
   if (visible.length === 0) {
-    // Empty repository: a single capability-only line names no ref.
-    const line = `${caps}${headSymref ? ` symref=HEAD:${headSymref}` : ''}\n`;
+    // Empty repository: the unborn-HEAD capability line carries a zero oid and the
+    // "capabilities^{}" sentinel ref name.
+    const symrefCap = headSymref ? ` symref=HEAD:${headSymref}` : '';
+    const line = `${ZERO_OID} capabilities^{}\0${caps}${symrefCap}\n`;
     const len = (line.length + 4).toString(16).padStart(4, '0');
     body += `${len}${line}`;
     return `${body}0000`;

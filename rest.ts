@@ -38,8 +38,16 @@ function parseBody(req: IncomingMessage): Promise<unknown> {
   });
 }
 
+/** The request origin, honoring the Host header (Link headers must stay on the entry's origin). */
+function originOf(req: IncomingMessage): string {
+  const host = req.headers.host || 'localhost';
+  return `http://${host}`;
+}
+
 function getPathParts(path: string): string[] {
-  return path.split('/').filter(p => p !== '');
+  // Strip the query string (and any fragment): route parts are path segments only.
+  const clean = path.split('?')[0].split('#')[0];
+  return clean.split('/').filter((p) => p !== '');
 }
 
 export function getAuthUser(req: IncomingMessage): User | null {
@@ -82,7 +90,7 @@ export function handleUserRepos(req: IncomingMessage, res: ServerResponse): bool
   const user = requireAuth(req, res);
   if (!user) return true;
   
-  const url = new URL(req.url ?? '', 'http://localhost');
+  const url = new URL(req.url ?? '', originOf(req));
   const page = parseInt(url.searchParams.get('page') || '1', 10);
   const perPage = Math.min(parseInt(url.searchParams.get('per_page') || '30', 10), 100);
   
@@ -261,7 +269,11 @@ export function handleContents(req: IncomingMessage, res: ServerResponse): boole
   if (req.method === 'PUT') {
     // PUT /repos/{owner}/{repo}/contents/{path}
     parseBody(req).then(async body => {
-      const { message, content, branch, sha } = body as { message: string; content: string; branch?: string; sha?: string };
+      // branch and sha may arrive as query parameters (GitHub accepts both).
+      const q = new URL(req.url ?? '', originOf(req)).searchParams;
+      const { message, content } = body as { message: string; content: string };
+      const branch = (body as any).branch ?? q.get('branch') ?? undefined;
+      const sha = (body as any).sha ?? q.get('sha') ?? undefined;
       if (!message || !content) {
         sendError(res, 422, 'Validation Failed');
         return;
@@ -309,7 +321,7 @@ export function handleContents(req: IncomingMessage, res: ServerResponse): boole
   
   if (req.method === 'GET') {
     // GET /repos/{owner}/{repo}/contents/{path}
-    const url = new URL(req.url ?? '', 'http://localhost');
+    const url = new URL(req.url ?? '', originOf(req));
     const ref = url.searchParams.get('ref') || repo.defaultBranch;
     
     // Try to get as file first
@@ -461,7 +473,7 @@ export function handleIssues(req: IncomingMessage, res: ServerResponse): boolean
   
   if (req.method === 'GET' && subPath === '') {
     // GET /repos/{owner}/{repo}/issues
-    const url = new URL(req.url ?? '', 'http://localhost');
+    const url = new URL(req.url ?? '', originOf(req));
     const state = url.searchParams.get('state') || 'open';
     const sort = url.searchParams.get('sort') || 'created';
     const direction = url.searchParams.get('direction') || 'desc';
@@ -520,7 +532,11 @@ export function handleIssues(req: IncomingMessage, res: ServerResponse): boolean
     if (req.method === 'PATCH') {
       parseBody(req).then(body => {
         const { state, title, body: issueBody } = body as { state?: 'open' | 'closed'; title?: string; body?: string };
-        const updated = storage.updateIssue(repo.id, issueNumber, { state, title, body: issueBody });
+        const updates: { state?: 'open' | 'closed'; title?: string; body?: string } = {};
+        if (state !== undefined) updates.state = state;
+        if (title !== undefined) updates.title = title;
+        if (issueBody !== undefined) updates.body = issueBody;
+        const updated = storage.updateIssue(repo.id, issueNumber, updates);
         if (!updated) {
           sendError(res, 404, 'Not Found');
           return;
@@ -543,8 +559,8 @@ export function handleIssues(req: IncomingMessage, res: ServerResponse): boolean
   }
   
   // Comments: /repos/{owner}/{repo}/issues/{number}/comments
-  if (parts.length === 8 && parts[6] === 'comments' && !isNaN(parseInt(parts[6 - 1], 10))) {
-    const issueNumber = parseInt(parts[6 - 1], 10);
+  if (parts.length === 8 && parts[5] === 'issues' && parts[7] === 'comments' && !isNaN(parseInt(parts[6], 10))) {
+    const issueNumber = parseInt(parts[6], 10);
     const issue = storage.getIssue(repo.id, issueNumber);
     if (!issue) {
       sendError(res, 404, 'Not Found');
@@ -636,7 +652,7 @@ export function handlePulls(req: IncomingMessage, res: ServerResponse): boolean 
   
   if (req.method === 'GET' && subPath === '') {
     // GET /repos/{owner}/{repo}/pulls
-    const url = new URL(req.url ?? '', 'http://localhost');
+    const url = new URL(req.url ?? '', originOf(req));
     const state = url.searchParams.get('state') || 'open';
     const perPage = Math.min(parseInt(url.searchParams.get('per_page') || '30', 10), 100);
     const page = parseInt(url.searchParams.get('page') || '1', 10);
@@ -853,7 +869,7 @@ export function handleCommits(req: IncomingMessage, res: ServerResponse): boolea
   }
   
   if (req.method === 'GET') {
-    const url = new URL(req.url ?? '', 'http://localhost');
+    const url = new URL(req.url ?? '', originOf(req));
     const sha = url.searchParams.get('sha') || repo.defaultBranch;
     const perPage = Math.min(parseInt(url.searchParams.get('per_page') || '30', 10), 100);
     const page = parseInt(url.searchParams.get('page') || '1', 10);

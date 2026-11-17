@@ -52,7 +52,7 @@ export interface PullRequest {
   repoId: number;
   title: string;
   body: string;
-  state: 'open' | 'closed' | 'merged';
+  state: 'open' | 'closed';
   head: { ref: string; sha: string };
   base: { ref: string; sha: string };
   merged: boolean;
@@ -120,7 +120,7 @@ class Storage {
   private refs = new Map<string, Ref[]>(); // key: owner/repo
   private gitObjects = new Map<string, GitObject>(); // key: sha
   private nextUserId = 1000;
-  private nextRepoId = 5000;
+  private nextRepoId = 6000;
   private nextIssueId = 1;
   private nextLabelId = 1;
   private nextPrId = 1;
@@ -690,7 +690,7 @@ class Storage {
     // If trees are the same, no changes to merge
     if (headTreeSha === baseTreeSha) {
       // Already up to date
-      pr.state = 'merged';
+      pr.state = 'closed';
       pr.merged = true;
       pr.mergeCommitSha = baseCommitSha;
       pr.mergedAt = new Date().toISOString();
@@ -745,7 +745,7 @@ class Storage {
     this.setRef(repo.owner, repo.name, `refs/heads/${pr.base.ref}`, mergeSha);
     
     // Update PR
-    pr.state = 'merged';
+    pr.state = 'closed';
     pr.merged = true;
     pr.mergeCommitSha = mergeSha;
     pr.mergedAt = new Date().toISOString();
@@ -1082,9 +1082,16 @@ class Storage {
     
     let targetTreeSha = treeSha;
     if (path) {
-      const result = this.findFileInTree(treeSha, path);
-      if (!result || result.entry.mode !== '40000') return null;
-      targetTreeSha = result.entry.sha;
+      // Walk to the directory entry itself (findFileInTree rejects directories).
+      const parts = path.split('/');
+      let current = treeSha;
+      for (const part of parts) {
+        const entries = this.getTreeEntries(current);
+        const entry = entries.find((e) => e.name === part);
+        if (!entry || entry.mode !== '40000') return null;
+        current = entry.sha;
+      }
+      targetTreeSha = current;
     }
     
     const entries = this.getTreeEntries(targetTreeSha);
@@ -1102,7 +1109,30 @@ class Storage {
     if (!repo) return null;
     
     const refName = branch || repo.defaultBranch;
-    const commitSha = this.getCommitShaForRef(repo.owner, repo.name, refName);
+    const ZERO = '0'.repeat(40);
+    let commitSha = this.getCommitShaForRef(repo.owner, repo.name, refName);
+    if (!commitSha && branch) {
+      // Writing to a branch that does not exist yet: fork from the default branch.
+      const baseSha = this.getCommitShaForRef(repo.owner, repo.name, repo.defaultBranch);
+      if (baseSha && baseSha !== ZERO) {
+        this.setRef(repo.owner, repo.name, `refs/heads/${refName}`, baseSha);
+        commitSha = baseSha;
+      }
+    }
+    if (!commitSha || commitSha === ZERO) {
+      // Unborn branch: seed a root commit off an empty tree (GitHub creates the first commit on PUT).
+      const rootTreeSha = this.createTree([]);
+      const now = Math.floor(Date.now() / 1000);
+      const rootSha = this.createCommit({
+        tree: rootTreeSha,
+        parents: [],
+        author: `Conformance <conformance@make.fun> ${now} +0000`,
+        committer: `Conformance <conformance@make.fun> ${now} +0000`,
+        message: 'Initial commit\n',
+      });
+      this.setRef(repo.owner, repo.name, `refs/heads/${refName}`, rootSha);
+      commitSha = rootSha;
+    }
     if (!commitSha) return null;
     
     // If sha provided, verify it matches current file content
@@ -1147,7 +1177,30 @@ class Storage {
     if (!repo) return null;
     
     const refName = branch || repo.defaultBranch;
-    const commitSha = this.getCommitShaForRef(repo.owner, repo.name, refName);
+    const ZERO = '0'.repeat(40);
+    let commitSha = this.getCommitShaForRef(repo.owner, repo.name, refName);
+    if (!commitSha && branch) {
+      // Writing to a branch that does not exist yet: fork from the default branch.
+      const baseSha = this.getCommitShaForRef(repo.owner, repo.name, repo.defaultBranch);
+      if (baseSha && baseSha !== ZERO) {
+        this.setRef(repo.owner, repo.name, `refs/heads/${refName}`, baseSha);
+        commitSha = baseSha;
+      }
+    }
+    if (!commitSha || commitSha === ZERO) {
+      // Unborn branch: seed a root commit off an empty tree (GitHub creates the first commit on PUT).
+      const rootTreeSha = this.createTree([]);
+      const now = Math.floor(Date.now() / 1000);
+      const rootSha = this.createCommit({
+        tree: rootTreeSha,
+        parents: [],
+        author: `Conformance <conformance@make.fun> ${now} +0000`,
+        committer: `Conformance <conformance@make.fun> ${now} +0000`,
+        message: 'Initial commit\n',
+      });
+      this.setRef(repo.owner, repo.name, `refs/heads/${refName}`, rootSha);
+      commitSha = rootSha;
+    }
     if (!commitSha) return null;
     
     // Verify SHA matches
