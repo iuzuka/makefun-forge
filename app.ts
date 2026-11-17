@@ -347,6 +347,15 @@ async function handleLsRefs(res: ServerResponse, owner: string, repoName: string
   const peel = args.includes('peel');
   const symrefs = args.includes('symrefs');
   const prefixes = args.filter((a) => a.startsWith('ref-prefix ')).map((a) => a.slice('ref-prefix '.length));
+  {
+    const lsKey = fetchCacheKey(['ls', owner, repoName, storage.repoGitEpoch(owner, repoName), args.includes('peel') ? 1 : 0, symrefs ? 1 : 0, prefixes.join(','), args.includes('unborn') ? 1 : 0]);
+    const hit = fetchCacheGet(lsKey);
+    if (hit) {
+      res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'cache-control': 'no-cache' });
+      res.end(hit);
+      return;
+    }
+  }
 
   const lines: string[] = [];
   const repo = storage.getRepo(owner, repoName);
@@ -379,6 +388,8 @@ async function handleLsRefs(res: ServerResponse, owner: string, repoName: string
 
   const pktOutput = encodePktLines(lines);
   const response = Buffer.concat([pktOutput, pktLineFlush()]);
+  const lsKey = fetchCacheKey(['ls', owner, repoName, storage.repoGitEpoch(owner, repoName), peel ? 1 : 0, symrefs ? 1 : 0, prefixes.join(','), args.includes('unborn') ? 1 : 0]);
+  fetchCachePut(lsKey, response);
   res.writeHead(200, {
     'content-type': 'application/x-git-upload-pack-result',
     'cache-control': 'no-cache',
@@ -401,6 +412,23 @@ function peeledObject(sha: string): string | null {
   }
 }
 
+/** Cached git fetch responses: a pure function of (repo, wants, haves, depth, shallow set). */
+const fetchCache = new Map<string, Buffer>();
+const FETCH_CACHE_MAX = 400;
+
+function fetchCacheKey(parts: (string | number | boolean | null)[]): string {
+  return parts.map((p) => (p === null ? '-' : String(p))).join('|');
+}
+
+function fetchCacheGet(key: string): Buffer | undefined {
+  return fetchCache.get(key);
+}
+
+function fetchCachePut(key: string, body: Buffer): void {
+  if (fetchCache.size >= FETCH_CACHE_MAX) fetchCache.clear();
+  fetchCache.set(key, body);
+}
+
 async function handleFetchV2(req: IncomingMessage, res: ServerResponse, owner: string, repoName: string, refs: Ref[], packets: GitPacket[], body: Buffer): Promise<void> {
   const wants: string[] = [];
   const haves: string[] = [];
@@ -418,6 +446,15 @@ async function handleFetchV2(req: IncomingMessage, res: ServerResponse, owner: s
   }
 
   // Objects reachable from the wants, minus what the client already has.
+  const cacheKey = fetchCacheKey(['v2', owner, repoName, storage.repoGitEpoch(owner, repoName), done ? 1 : 0, deepen, wants.join(','), haves.join(','), shallowIn.join(',')]);
+  if (done && haves.length === 0) {
+    const hit = fetchCacheGet(cacheKey);
+    if (hit) {
+      res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'cache-control': 'no-cache' });
+      res.end(hit);
+      return;
+    }
+  }
   const plan = computePackPlan(wants, haves, deepen, shallowIn);
 
   const out: Buffer[] = [];
@@ -450,8 +487,10 @@ async function handleFetchV2(req: IncomingMessage, res: ServerResponse, owner: s
   }
   out.push(pktLineFlush());
 
+  const responseBody = Buffer.concat(out);
+  if (done && haves.length === 0) fetchCachePut(cacheKey, responseBody);
   res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'cache-control': 'no-cache' });
-  res.end(Buffer.concat(out));
+  res.end(responseBody);
 }
 
 interface PackPlan {
@@ -602,6 +641,15 @@ async function handleUploadPackV0(req: IncomingMessage, res: ServerResponse, own
   }
 
   const wantsInStore = wants.filter((w) => storage.getObject(w) !== null);
+  const cacheKey = fetchCacheKey(['v0', owner, repoName, storage.repoGitEpoch(owner, repoName), done ? 1 : 0, sideband ? 1 : 0, deepen, wantsInStore.join(','), haves.join(',')]);
+  if (done && haves.length === 0) {
+    const hit = fetchCacheGet(cacheKey);
+    if (hit) {
+      res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'cache-control': 'no-cache' });
+      res.end(hit);
+      return;
+    }
+  }
   const plan = computePackPlan(wantsInStore, done ? haves : [], deepen, []);
 
   const out: Buffer[] = [];
@@ -639,8 +687,10 @@ async function handleUploadPackV0(req: IncomingMessage, res: ServerResponse, own
   }
   out.push(pktLineFlush());
 
+  const v0Body = Buffer.concat(out);
+  if (done && haves.length === 0) fetchCachePut(cacheKey, v0Body);
   res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'cache-control': 'no-cache' });
-  res.end(Buffer.concat(out));
+  res.end(v0Body);
 }
 
 async function handleReceivePackHandler(req: IncomingMessage, res: ServerResponse, owner: string, repoName: string): Promise<void> {

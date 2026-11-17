@@ -118,6 +118,12 @@ class Storage {
   private pullRequests = new Map<number, PullRequest[]>(); // key: repoId
   private comments = new Map<number, Comment[]>(); // key: issueId
   private refs = new Map<string, Ref[]>(); // key: owner/repo
+  private gitEpoch = new Map<string, number>(); // key: owner/repo — bumped on every ref change
+
+  /** Monotonic per-repo epoch: every ref/commit-changing write bumps it (git fetch cache key). */
+  repoGitEpoch(owner: string, repo: string): number {
+    return this.gitEpoch.get(`${owner}/${repo}`) ?? 0;
+  }
   private gitObjects = new Map<string, GitObject>(); // key: sha
   private nextUserId = 1000;
   private nextRepoId = 20000;
@@ -422,6 +428,8 @@ class Storage {
 
   setRef(owner: string, repo: string, name: string, sha: string): void {
     const key = `${owner}/${repo}`;
+    this.gitEpoch.set(key, (this.gitEpoch.get(key) ?? 0) + 1);
+
     const refs = this.refs.get(key) || [];
     const idx = refs.findIndex(r => r.name === name);
     if (idx >= 0) {
@@ -434,6 +442,7 @@ class Storage {
 
   deleteRef(owner: string, repo: string, name: string): boolean {
     const key = `${owner}/${repo}`;
+    this.gitEpoch.set(key, (this.gitEpoch.get(key) ?? 0) + 1);
     const refs = this.refs.get(key) || [];
     const idx = refs.findIndex(r => r.name === name);
     if (idx >= 0) {
