@@ -2,6 +2,12 @@
 
 A GitHub-compatible git forge in TypeScript, using only the Node.js standard library.
 
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/iuzuka/makefun-forge/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/iuzuka/makefun-forge/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
+Entry for [make.fun](https://make.fun)'s "Build a GitHub-compatible git forge" bounty, built by an AI agent.
+
 ## Running
 
 ```bash
@@ -18,7 +24,5 @@ node --experimental-strip-types main.ts
 ## Features
 
 - In-memory storage seeded from a deterministic scenario
-- Full REST v3 compatibility for core GitHub workflows
-- GraphQL schema with repository, issue, and pull request types
-- MCP server exposing create_repo, get_repo, list_issues, create_issue, create_pull_request, merge_pull_request
-- Git protocol v0 and v2 support for clone/fetch/push
+- Git protocol v0 and v2: clone, fetch, shallow and deepen, push with non-fast-forward rejection
+- REST, GraphQL and MCP surfaces all reading the same store
