@@ -16,6 +16,8 @@
 //
 // main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
 
+process.on('uncaughtException', (err) => { require('node:fs').appendFileSync('/tmp/forge-crash.log', Date.now() + ' UNCAUGHT ' + (err && err.stack || String(err)) + '\n'); });
+process.on('unhandledRejection', (err) => { require('node:fs').appendFileSync('/tmp/forge-crash.log', Date.now() + ' UNHANDLED ' + (err && err.stack || String(err)) + '\n'); });
 import { createApp } from './app.ts';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
