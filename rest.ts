@@ -900,7 +900,7 @@ export function handleCommits(req: IncomingMessage, res: ServerResponse): boolea
         commits.push({
           sha: currentSha,
           commit: {
-            message: commit.message,
+            message: commit.message.replace(/\n+$/, ''),
             author: {
               name: commit.author.split(' <')[0],
               email: commit.author.match(/<(.+)>/)?.[1] || '',

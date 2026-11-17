@@ -120,7 +120,7 @@ class Storage {
   private refs = new Map<string, Ref[]>(); // key: owner/repo
   private gitObjects = new Map<string, GitObject>(); // key: sha
   private nextUserId = 1000;
-  private nextRepoId = 6000;
+  private nextRepoId = 20000;
   private nextIssueId = 1;
   private nextLabelId = 1;
   private nextPrId = 1;
