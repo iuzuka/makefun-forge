@@ -353,48 +353,74 @@ async function handleReceivePackHandler(req: IncomingMessage, res: ServerRespons
     chunks.push(chunk);
   }
   const body = Buffer.concat(chunks);
-  
-  // Parse pkt-line commands
-  const packets = decodePktLines(body, { allowTrailing: true });
-  const commands = parsePushCommands(packets);
-  
-  // Find pack data (after flush packet)
+
+  // Parse pkt-line commands over the RAW bytes: after the flush that ends the command
+  // list, the rest of the body is raw pack data (never pkt-line framed).
+  let commands: PushCommand[] = [];
   let packData: Buffer | null = null;
-  let foundFlush = false;
-  let packStart = 0;
-  for (let i = 0; i < packets.length; i++) {
-    if (packets[i].kind === 'flush') {
-      foundFlush = true;
-      packStart = i + 1;
-      break;
+  let capabilities = new Map<string, string>();
+  {
+    let offset = 0;
+    const pktBuffers: Buffer[] = [];
+    let sawFlush = false;
+    while (offset + 4 <= body.length) {
+      const hex = body.subarray(offset, offset + 4).toString('ascii');
+      if (!/^[0-9a-f]{4}$/.test(hex)) break;
+      const len = parseInt(hex, 16);
+      if (len === 0) {
+        // flush-pkt: end of the command list
+        offset += 4;
+        sawFlush = true;
+        break;
+      }
+      if (len < 4 || offset + len > body.length) break;
+      pktBuffers.push(body.subarray(offset + 4, offset + len));
+      offset += len;
+    }
+    const commandPackets = pktBuffers.map((raw) => ({ kind: 'data' as const, raw, data: raw, payload: raw }));
+    commands = parsePushCommands(commandPackets as any);
+    // Capabilities ride on the first command line, after a NUL byte
+    if (pktBuffers.length > 0) {
+      const first = pktBuffers[0].toString('utf8');
+      const nul = first.indexOf('\0');
+      if (nul >= 0) {
+        for (const cap of first.slice(nul + 1).trim().split(' ')) {
+          if (cap) capabilities.set(cap, '');
+        }
+      }
+    }
+    if (sawFlush && offset < body.length) {
+      packData = body.subarray(offset);
     }
   }
-  
-  if (foundFlush && packStart < packets.length) {
-    // Collect remaining raw data as pack
-    const packPackets = packets.slice(packStart);
-    const packParts: Buffer[] = [];
-    for (const packet of packPackets) {
-      if (packet.kind === 'data') packParts.push(packet.raw);
-    }
-    if (packParts.length > 0) {
-      packData = Buffer.concat(packParts);
-    }
-  }
-  
+
   // Get objects client already has (from advertisement)
   const haveObjects = new Map<string, GitObject>();
-  // In a real implementation, we'd parse the haves from the request
-  
+
   const result = await handleReceivePack(owner, repoName, commands, packData, haveObjects);
-  
-  // Format report
+
+  // Format report; when the client asked for side-band-64k, wrap the report in
+  // side-band channel 1 chunks so the suite can frame it.
   const reportBody = formatPushReport(result.report!);
   const reportPkt = encodePktLines([reportBody, 'flush']);
-  
+  let responseBody: Buffer;
+  if (capabilities.get('side-band-64k') !== undefined) {
+    const CHUNK = 65515;
+    const parts: Buffer[] = [];
+    for (let i = 0; i < reportPkt.length; i += CHUNK) {
+      const slice = reportPkt.subarray(i, Math.min(i + CHUNK, reportPkt.length));
+      const header = Buffer.from(((slice.length + 1).toString(16)).padStart(4, '0'), 'ascii');
+      parts.push(header, Buffer.from([1]), slice);
+    }
+    parts.push(Buffer.from('0000', 'ascii'));
+    responseBody = Buffer.concat(parts);
+  } else {
+    responseBody = reportPkt;
+  }
+
   res.writeHead(200, {
     'content-type': 'application/x-git-receive-pack-result',
     'cache-control': 'no-cache',
   });
-  res.end(reportPkt);
+  res.end(responseBody);
 }
