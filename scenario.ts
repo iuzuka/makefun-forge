@@ -14,7 +14,7 @@ var SCENARIO_COMMITS = 60;
 var SCENARIO_ISSUES = 60;
 var SCENARIO_PULLS = 30;
 var DEFAULT_BRANCH = "main";
-function fnv1a64(text) {
+export function fnv1a64(text) {
   let hash = 0xcbf29ce484222325n;
   for (let i = 0; i < text.length; i += 1) {
     hash ^= BigInt(text.charCodeAt(i));
@@ -22,16 +22,16 @@ function fnv1a64(text) {
   }
   return hash;
 }
-function mix64(value) {
+export function mix64(value) {
   let z = value + 0x9e3779b97f4a7c15n & U64_MASK;
   z = (z ^ z >> 30n) * 0xbf58476d1ce4e5b9n & U64_MASK;
   z = (z ^ z >> 27n) * 0x94d049bb133111ebn & U64_MASK;
   return (z ^ z >> 31n) & U64_MASK;
 }
-function scenarioSeedFor(label) {
+export function scenarioSeedFor(label) {
   return mix64(SCENARIO_SEED ^ fnv1a64(label));
 }
-function scenarioRng(label) {
+export function scenarioRng(label) {
   return new Rng(scenarioSeedFor(label));
 }
 var HEX_DIGITS = "0123456789abcdef";
@@ -426,7 +426,7 @@ var SENTENCE_ENDS = Object.freeze([
 ]);
 var ISSUE_LABELS = Object.freeze(["bug", "enhancement", "documentation", "question", "good first issue", "help wanted"]);
 var DEFAULT_BRANCHES = Object.freeze(["main", "develop", "release/1.0"]);
-function generateUsers(rng, count) {
+export function generateUsers(rng, count) {
   const used = /* @__PURE__ */ new Set();
   const users = [];
   for (let i = 0; i < Math.max(0, Math.trunc(count)); i += 1) {
@@ -444,7 +444,7 @@ function generateUsers(rng, count) {
   }
   return users;
 }
-function generateRepos(rng, owner, count, firstId = 5e3) {
+export function generateRepos(rng, owner, count, firstId = 5e3) {
   const used = /* @__PURE__ */ new Set();
   const repos = [];
   for (let i = 0; i < Math.max(0, Math.trunc(count)); i += 1) {
@@ -470,7 +470,7 @@ function generateRepos(rng, owner, count, firstId = 5e3) {
   }
   return repos;
 }
-function generateFilePaths(rng, count) {
+export function generateFilePaths(rng, count) {
   const used = /* @__PURE__ */ new Set();
   const paths = [];
   for (let i = 0; i < Math.max(0, Math.trunc(count)); i += 1) {
@@ -488,7 +488,7 @@ function generateFilePaths(rng, count) {
   }
   return paths;
 }
-function generateBlobText(rng, sizeBytes) {
+export function generateBlobText(rng, sizeBytes) {
   const size = Number.isFinite(sizeBytes) ? Math.max(0, Math.trunc(sizeBytes)) : 0;
   let out = "";
   while (out.length < size) {
@@ -515,7 +515,7 @@ function bytesToBase64(bytes) {
 function textToBase64(text) {
   return bytesToBase64(new TextEncoder().encode(text));
 }
-function generateBlob(rng, path, sizeBytes) {
+export function generateBlob(rng, path, sizeBytes) {
   const content = generateBlobText(rng, sizeBytes);
   return Object.freeze({ path, content, base64: textToBase64(content) });
 }
@@ -523,13 +523,13 @@ function scenarioDate(rng) {
   const epochSec = SCENARIO_EPOCH_SEC + rng.nextInt(90 * 24 * 60 * 60);
   return Object.freeze({ epochSec, iso: new Date(epochSec * 1e3).toISOString() });
 }
-function generateCommitMessage(rng) {
+export function generateCommitMessage(rng) {
   const head = `${rng.pick(COMMIT_VERBS)} ${rng.pick(COMMIT_OBJECTS)}`;
   return rng.chance(0.35) ? `${head}
 
 ${generateSentence(rng)}` : head;
 }
-function generateCommit(rng, author) {
+export function generateCommit(rng, author) {
   const when = scenarioDate(rng);
   return Object.freeze({ message: generateCommitMessage(rng), author, epochSec: when.epochSec, iso: when.iso });
 }
@@ -542,19 +542,19 @@ function generateBody(rng) {
   for (let i = 0; i < count; i += 1) sentences.push(generateSentence(rng));
   return sentences.join(" ");
 }
-function generateIssue(rng) {
+export function generateIssue(rng) {
   return Object.freeze({
     title: `${rng.pick(ISSUE_ADJECTIVES)} ${rng.pick(ISSUE_SUBJECTS)}`,
     body: generateBody(rng),
     labels: rng.chance(0.5) ? [rng.pick(ISSUE_LABELS)] : []
   });
 }
-function generateBranchName(rng) {
+export function generateBranchName(rng) {
   const kind = rng.pick(["feature", "fix", "perf", "docs", "chore"]);
   const subject = rng.pick(PULL_SUBJECTS).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
   return `${kind}/${subject}`;
 }
-function generatePull(rng, base = DEFAULT_BRANCH) {
+export function generatePull(rng, base = DEFAULT_BRANCH) {
   return Object.freeze({
     title: `${rng.pick(PULL_VERBS)} ${rng.pick(PULL_SUBJECTS)}`,
     body: generateBody(rng),
@@ -562,7 +562,7 @@ function generatePull(rng, base = DEFAULT_BRANCH) {
     base
   });
 }
-function uniqueBranch(rng, used) {
+export function uniqueBranch(rng, used) {
   let branch = generateBranchName(rng);
   let suffix = 2;
   while (used.has(branch)) {
