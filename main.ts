@@ -16,8 +16,9 @@
 //
 // main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
 
-process.on('uncaughtException', (err) => { require('node:fs').appendFileSync('/tmp/forge-crash.log', Date.now() + ' UNCAUGHT ' + (err && err.stack || String(err)) + '\n'); });
-process.on('unhandledRejection', (err) => { require('node:fs').appendFileSync('/tmp/forge-crash.log', Date.now() + ' UNHANDLED ' + (err && err.stack || String(err)) + '\n'); });
+import { appendFileSync } from 'node:fs';
+process.on('uncaughtException', (err) => { appendFileSync('/tmp/forge-crash.log', Date.now() + ' UNCAUGHT ' + (err && err.stack || String(err)) + '\n'); });
+process.on('unhandledRejection', (err) => { appendFileSync('/tmp/forge-crash.log', Date.now() + ' UNHANDLED ' + (err && err.stack || String(err)) + '\n'); });
 import { createApp } from './app.ts';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
@@ -81,9 +82,11 @@ async function waitForDone(): Promise<void> {
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
   const server = createApp();
+  // MAKEFUN_ENTRY_PORT is a local development override (0 = the kernel picks a free port).
+  const boundPort = Number(process.env.MAKEFUN_ENTRY_PORT ?? '') || 0;
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(0, () => resolve());
+    server.listen(boundPort, () => resolve());
   });
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');

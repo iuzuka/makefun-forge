@@ -1,5 +1,6 @@
 // The HTTP server for the forge
 
+import { appendFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { storage } from './storage.ts';
 import type { Repository, Ref } from './storage.ts';
@@ -35,6 +36,68 @@ import {
 } from './git.ts';
 import type { GitPacket, AdvertisedRef, PushCommand, PushReport, GitObject } from './git.ts';
 import { parseTree, formatRefsAdvertisementV0 } from './git.ts';
+import { executeGraphQLDocument, type GraphQLResult } from './graphql.ts';
+import { handleMcpRequest } from './mcp.ts';
+
+/** Read one request body (bounded) as UTF-8 text. */
+function readBody(req: IncomingMessage, limit = 4 * 1024 * 1024): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(new Error('body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+/** Serve POST /api/graphql: single {query, variables} or a JSON array of those (batch). */
+async function handleGraphQL(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
+  if (req.method !== 'POST' || pathOf(req) !== '/api/graphql') return false;
+  const user = (req as unknown as { user?: { id: number; login: string } | null }).user ?? null;
+  let bodyText = '';
+  try {
+    bodyText = await readBody(req);
+  } catch {
+    sendJson(res, 400, { message: 'Invalid request body' });
+    return true;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bodyText || '{}');
+  } catch {
+    sendJson(res, 400, { errors: [{ message: 'The request body is not valid JSON.' }] });
+    return true;
+  }
+  if (Array.isArray(parsed)) {
+    const results = parsed.map((entry) => {
+      const record = (entry ?? {}) as Record<string, unknown>;
+      try {
+        return executeGraphQLDocument(storage, user, String(record.query ?? ''), record.variables);
+      } catch (error) {
+        return { errors: [{ message: (error as Error).message }] };
+      }
+    });
+    sendJson(res, 200, results);
+    return true;
+  }
+  const record = (parsed ?? {}) as Record<string, unknown>;
+  let result: GraphQLResult;
+  try {
+    result = executeGraphQLDocument(storage, user, String(record.query ?? ''), record.variables);
+  } catch (error) {
+    result = { errors: [{ message: (error as Error).message }] };
+  }
+  sendJson(res, 200, result);
+  return true;
+}
 
 // Seed the store on startup
 storage.seedStore();
@@ -100,16 +163,27 @@ export function createApp(): Server {
       return;
     }
 
-    // GraphQL endpoint (stub)
-    if (method === 'POST' && path === '/api/graphql') {
-      sendJson(res, 200, { data: {} });
-      return;
-    }
+    // GraphQL endpoint: single documents and the batched array form.
+    if (await handleGraphQL(req, res)) return;
 
-    // MCP endpoint (stub)
-    if (method === 'POST' && path === '/mcp') {
-      sendJson(res, 200, { jsonrpc: '2.0', id: 1, result: {} });
-      return;
+    // MCP endpoint: the legacy JSON-RPC surface (initialize, tools/list, tools/call).
+    {
+      const mcpPath = pathOf(req) === '/mcp';
+      const mcpUser = mcpPath ? getAuthUser(req) : undefined;
+      if (mcpPath && req.method === 'POST') {
+        let bodyText = '';
+        try {
+          bodyText = await readBody(req);
+        } catch {
+          sendJson(res, 400, { message: 'Invalid request body' });
+          return;
+        }
+        const answer = handleMcpRequest(storage, mcpUser, req.method ?? 'POST', bodyText);
+        if (answer !== false) {
+          sendJson(res, answer.status, answer.body);
+          return;
+        }
+      }
     }
 
     // Everything else: GitHub's 404 body.
@@ -168,7 +242,7 @@ async function handleInfoRefs(req: IncomingMessage, res: ServerResponse, owner: 
   if (wantsV2 && service === 'git-upload-pack') {
     // Protocol v2 advertisement
     const caps = new Map([
-      ['fetch', ''],
+      ['fetch', 'shallow'],
       ['ls-refs', ''],
       ['server-option', ''],
       ['object-format', 'sha1'],
@@ -280,13 +354,14 @@ async function handleLsRefs(res: ServerResponse, owner: string, repoName: string
   const branchRefs = new Map(refs.map((r) => [r.name, r]));
   const mainRef = branchRefs.get(`refs/heads/${headBranch}`);
 
-  // HEAD comes first, symref-target reported when requested.
-  if (prefixes.length === 0 || prefixes.some((p) => 'HEAD'.startsWith(p) || p === '')) {
-    if (mainRef) {
-      lines.push(symrefs ? `${mainRef.sha} HEAD symref-target:refs/heads/${headBranch}\n` : `${mainRef.sha} HEAD\n`);
-    } else {
-      lines.push(`unborn HEAD symref-target:refs/heads/${headBranch}\n`);
-    }
+  // HEAD comes first, symref-target reported when requested. The unborn form is only sent
+  // when the client asked for `unborn` (we never advertise the capability, so normally the
+  // HEAD line is simply omitted for an empty repository).
+  const wantsHead = prefixes.length === 0 || prefixes.some((p) => 'HEAD'.startsWith(p) || p === '');
+  if (wantsHead && mainRef) {
+    lines.push(symrefs ? `${mainRef.sha} HEAD symref-target:refs/heads/${headBranch}\n` : `${mainRef.sha} HEAD\n`);
+  } else if (wantsHead && args.includes('unborn')) {
+    lines.push(`unborn HEAD symref-target:refs/heads/${headBranch}\n`);
   }
   for (const ref of refs) {
     if (prefixes.length > 0 && !prefixes.some((p) => ref.name.startsWith(p))) continue;
@@ -361,13 +436,13 @@ async function handleFetchV2(req: IncomingMessage, res: ServerResponse, owner: s
     const si: string[] = ['shallow-info\n'];
     for (const oid of plan.shallow) si.push(`shallow ${oid}\n`);
     for (const oid of plan.unshallow) si.push(`unshallow ${oid}\n`);
-    out.push(encodePktLines(si));
+    out.push(encodePktLines(si), pktLineFlush());
   }
 
   out.push(encodePktLines(['packfile\n']));
   if (plan.pack.length > 0) {
     // Packfile section: sideband-64k framing (band 1) per protocol v2.
-    const CHUNK = 65519;
+    const CHUNK = 65515;
     for (let off = 0; off < plan.pack.length; off += CHUNK) {
       const piece = plan.pack.subarray(off, Math.min(off + CHUNK, plan.pack.length));
       out.push(encodePktLine(Buffer.concat([Buffer.from([1]), piece])));
@@ -409,7 +484,10 @@ function computePackPlan(wants: string[], haves: string[], deepen: number | null
   };
 
   const addCommit = (sha: string, remaining: number): void => {
-    if (commits.has(sha) || haveSet.has(sha)) return;
+    if (commits.has(sha)) return;
+    // A shallow have is walked past when the client deepens: it holds the commit but not
+    // its parents, so a deepen must deliver them.
+    if (haveSet.has(sha) && !(deepen !== null && shallowIn.includes(sha))) return;
     const obj = storage.getObject(sha);
     if (!obj || obj.type !== 'commit') return;
     commits.add(sha);
@@ -419,9 +497,10 @@ function computePackPlan(wants: string[], haves: string[], deepen: number | null
     if (treeMatch) collectTree(treeMatch[1]);
     const parentLines = [...text.matchAll(/^parent ([0-9a-f]{40})/gm)].map((m) => m[1]);
     if (remaining <= 1) {
-      // Shallow boundary: parents are not included (unless already known to the client).
+      // Shallow boundary: this commit is included but its parents are not (unless the
+      // client already knows them) — the boundary itself is the shallow commit.
       for (const parent of parentLines) {
-        if (!haveSet.has(parent) && !commits.has(parent)) shallow.push(parent);
+        if (!haveSet.has(parent) && !commits.has(parent)) shallow.push(sha);
       }
       return;
     }
@@ -448,15 +527,45 @@ function computePackPlan(wants: string[], haves: string[], deepen: number | null
   };
 
   for (const want of wants) {
-    if (haveSet.has(want)) continue;
+    // A shallow want the client is deepening must still be walked (its parents are new).
+    if (haveSet.has(want) && !(deepen !== null && shallowIn.includes(want))) continue;
     collectFrom(want, 0);
   }
 
-  // Exclude objects the client already has (only meaningful for incremental fetches).
-  for (const sha of [...objects.keys()]) {
-    if (haveSet.has(sha)) objects.delete(sha);
+  // Exclude everything reachable from the client's haves: an incremental fetch must not
+  // re-send objects the client already holds.
+  if (haves.length > 0) {
+    const haveClosure = new Set<string>();
+    const walkHave = (sha: string): void => {
+      if (haveClosure.has(sha)) return;
+      const obj = storage.getObject(sha);
+      if (!obj) return;
+      haveClosure.add(sha);
+      if (obj.type === 'commit') {
+        const text = obj.data.toString('utf8');
+        const treeMatch = /^tree ([0-9a-f]{40})/m.exec(text);
+        if (treeMatch) walkHave(treeMatch[1]);
+        // A shallow boundary stops the walk: the client does not hold the parents.
+        if (!shallowIn.includes(sha)) {
+          for (const m of text.matchAll(/^parent ([0-9a-f]{40})/gm)) walkHave(m[1]);
+        }
+      } else if (obj.type === 'tree') {
+        for (const entry of parseTree(obj.data)) walkHave(entry.sha);
+      } else if (obj.type === 'tag') {
+        const m = /^object ([0-9a-f]{40})/m.exec(obj.data.toString('utf8'));
+        if (m) walkHave(m[1]);
+      }
+    };
+    for (const have of haves) walkHave(have);
+    for (const sha of [...objects.keys()]) {
+      if (haveClosure.has(sha) && !haveSet.has(sha)) objects.delete(sha);
+    }
+    for (const sha of [...objects.keys()]) {
+      if (haveSet.has(sha)) objects.delete(sha);
+    }
   }
 
+  const planShallow = (): string => [...new Set(shallow)].join(',');
   const pack = objects.size > 0 ? writePack([...objects.values()].map((o) => ({ type: o.type, data: o.data }))) : Buffer.alloc(0);
   // Every `have` the client reports is by definition an object we also hold; report them as common.
   return { pack, shallow: [...new Set(shallow)], unshallow: [...new Set(unshallow)], common: haves.slice() };
@@ -515,14 +624,14 @@ async function handleUploadPackV0(req: IncomingMessage, res: ServerResponse, own
 
   if (plan.pack.length > 0) {
     if (sideband) {
-      const CHUNK = 65519;
+      const CHUNK = 65515;
       for (let off = 0; off < plan.pack.length; off += CHUNK) {
         const piece = plan.pack.subarray(off, Math.min(off + CHUNK, plan.pack.length));
         out.push(encodePktLine(Buffer.concat([Buffer.from([1]), piece])));
       }
     } else {
       // Without sideband the packfile rides in raw pkt-line chunks.
-      const CHUNK = 65519;
+      const CHUNK = 65515;
       for (let off = 0; off < plan.pack.length; off += CHUNK) {
         out.push(encodePktLine(plan.pack.subarray(off, Math.min(off + CHUNK, plan.pack.length))));
       }

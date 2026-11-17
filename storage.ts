@@ -290,8 +290,8 @@ class Storage {
     }
   }
 
-  // User management
   getUserByToken(token: string): User | null {
+
     // The suite's bearer token (env MAKEFUN_SHOP_TOKEN) is the viewer's; any other token names
     // a different login, so viewer-owned resources read as 404 for it (repos.foreign-token).
     const envToken = process.env.MAKEFUN_SHOP_TOKEN;
@@ -325,7 +325,7 @@ class Storage {
       updatedAt: now,
     };
     this.repos.set(key, repo);
-    this.refs.set(key, [{ name: `refs/heads/${DEFAULT_BRANCH}`, sha: '0'.repeat(40) }]);
+    // An unborn repository has no refs (a zero-oid ref would leak into ls-refs/advertisement).
     this.issues.set(repo.id, []);
     this.labels.set(repo.id, []);
     this.pullRequests.set(repo.id, []);
@@ -338,7 +338,37 @@ class Storage {
     return this.repos.get(`${owner}/${name}`) || null;
   }
 
+  /** Every repository in the store (GraphQL node() lookups). */
+  allRepos(): Repository[] {
+    return [...this.repos.values()];
+  }
+
+  /** The repository holding an issue, by issue global id (GraphQL closeIssue/addComment). */
+  repoIdOfIssue(issueId: number): number | null {
+    for (const [repoId, list] of this.issues) {
+      if (list.some((issue) => issue.id === issueId)) return repoId;
+    }
+    return null;
+  }
+
+  getIssueById(issueId: number): Issue | null {
+    for (const list of this.issues.values()) {
+      const issue = list.find((entry) => entry.id === issueId);
+      if (issue) return issue;
+    }
+    return null;
+  }
+
+  getPullRequestById(prId: number): PullRequest | null {
+    for (const list of this.pullRequests.values()) {
+      const pr = list.find((entry) => entry.id === prId);
+      if (pr) return pr;
+    }
+    return null;
+  }
+
   getRepoById(id: number): Repository | null {
+
     for (const repo of this.repos.values()) {
       if (repo.id === id) return repo;
     }

@@ -864,8 +864,11 @@ export function parsePushCommands(packets: GitPacket[]): PushCommand[] {
   for (const packet of packets) {
     if (packet.kind !== 'data') continue;
     const line = packet.payload.toString('utf8').replace(/\n$/, '');
-    if (!line) continue;
-    const parts = line.split(' ');
+    // Capabilities ride the first command line after a NUL byte; drop them.
+    const nul = line.indexOf('\0');
+    const clean = nul >= 0 ? line.slice(0, nul) : line;
+    if (!clean) continue;
+    const parts = clean.split(' ');
     if (parts.length >= 3) {
       commands.push({ oldOid: parts[0], newOid: parts[1], ref: parts[2] });
     }
@@ -948,6 +951,25 @@ export async function handleReceivePack(
       if (!obj && !haveObjects.has(cmd.newOid)) {
         report.refs.push({ ref: cmd.ref, ok: false, reason: 'missing object', options: new Map() });
         continue;
+      }
+      // Reject a non-fast-forward update of an existing ref: the client's old value must
+      // be an ancestor of the new commit (a create or delete passes this trivially).
+      if (currentSha !== ZERO_OID && cmd.oldOid === currentSha) {
+        const isAncestor = (target: string, from: string, seen: Set<string> = new Set()): boolean => {
+          if (target === from) return true;
+          if (seen.has(from)) return false;
+          seen.add(from);
+          const commit = storage.getObject(from);
+          if (!commit || commit.type !== 'commit') return false;
+          for (const m of commit.data.toString('utf8').matchAll(/^parent ([0-9a-f]{40})/gm)) {
+            if (isAncestor(target, m[1], seen)) return true;
+          }
+          return false;
+        };
+        if (!isAncestor(currentSha, cmd.newOid)) {
+          report.refs.push({ ref: cmd.ref, ok: false, reason: 'non-fast-forward', options: new Map() });
+          continue;
+        }
       }
       storage.setRef(owner, repoName, cmd.ref, cmd.newOid);
       refMap.set(cmd.ref, cmd.newOid);
