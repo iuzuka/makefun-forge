@@ -739,16 +739,25 @@ export function parseAdvertisement(packets: GitPacket[], service: string): Adver
 }
 
 export function formatRefsAdvertisementV0(refs: Ref[], service: string, capabilities: Map<string, string>, headSymref: string | null): string {
+  const caps = [...capabilities.entries()]
+    .map(([key, value]) => (value ? `${key}=${value}` : key))
+    .join(' ');
+  const visible = refs.filter((ref) => ref.sha !== ZERO_OID);
   let body = '';
-  for (const ref of refs) {
-    if (ref.sha === ZERO_OID) continue;
-    const line = `${ref.sha} ${ref.name}\n`;
+  if (visible.length === 0) {
+    // Empty repository: a single capability-only line names no ref.
+    const line = `${caps}${headSymref ? ` symref=HEAD:${headSymref}` : ''}\n`;
     const len = (line.length + 4).toString(16).padStart(4, '0');
     body += `${len}${line}`;
+    return `${body}0000`;
   }
-  // Add capabilities to first ref (simplified)
-  body += '0000';
-  return body;
+  visible.forEach((ref, index) => {
+    let line = `${ref.sha} ${ref.name}${headSymref && ref.name === headSymref ? ` symref=HEAD:${headSymref}` : ''}\n`;
+    if (index === 0 && caps) line = `${ref.sha} ${ref.name}\0${caps}${headSymref && ref.name === headSymref ? ` symref=HEAD:${headSymref}` : ''}\n`;
+    const len = (line.length + 4).toString(16).padStart(4, '0');
+    body += `${len}${line}`;
+  });
+  return `${body}0000`;
 }
 
 export function formatRefsAdvertisementV2(capabilities: Map<string, string>): string {
