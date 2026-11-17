@@ -292,9 +292,14 @@ class Storage {
 
   // User management
   getUserByToken(token: string): User | null {
-    // In a real implementation, this would validate the token
-    // For now, we use the token as the login
-    return this.users.get(token) || null;
+    // The suite's bearer token (env MAKEFUN_SHOP_TOKEN) is the viewer's; any other token names
+    // a different login, so viewer-owned resources read as 404 for it (repos.foreign-token).
+    const envToken = process.env.MAKEFUN_SHOP_TOKEN;
+    if (envToken && token === envToken) return this.users.get('adaiversen') ?? null;
+    if (this.users.has(token)) return this.users.get(token)!;
+    const other: User = { id: 9000 + (token.length % 7), login: `foreign-${token.slice(0, 6)}`, name: 'Foreign', email: 'foreign@example.invalid' };
+    this.users.set(token, other);
+    return other;
   }
 
   setUser(token: string, user: User): void {
