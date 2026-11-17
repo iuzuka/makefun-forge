@@ -4,7 +4,6 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { storage } from './storage.ts';
 import type { Repository, Ref } from './storage.ts';
 import {
-  encodePktLine,
   sendJson,
   sendError,
   handleApiRoot,
