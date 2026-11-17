@@ -176,7 +176,8 @@ async function handleInfoRefs(req: IncomingMessage, res: ServerResponse, owner: 
     ]);
     
     const body = formatRefsAdvertisementV2(caps);
-    const pktLines = encodePktLines(['# service=git-upload-pack\n', body, 'flush']);
+    // Smart HTTP preamble: the service line, then a flush-pkt, then the v2 advertisement.
+    const pktLines = encodePktLines(['# service=git-upload-pack\n', 'flush', body, 'flush']);
     
     res.writeHead(200, {
       'content-type': 'application/x-git-upload-pack-advertisement',
@@ -221,7 +222,8 @@ async function handleInfoRefs(req: IncomingMessage, res: ServerResponse, owner: 
       'content-type': `application/x-${service}-advertisement`,
       'cache-control': 'no-cache',
     });
-    res.end(Buffer.concat([servicePkt, Buffer.from(body, 'ascii')]));
+    // v0 smart HTTP preamble: service line, flush-pkt, then the ref advertisement.
+    res.end(Buffer.concat([servicePkt, Buffer.from('0000', 'ascii'), Buffer.from(body, 'ascii')]));
   }
 }
 
